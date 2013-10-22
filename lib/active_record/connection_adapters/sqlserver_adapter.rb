@@ -201,6 +201,7 @@ module ActiveRecord
         # Our Responsibility
         @config = config
         @connection_options = config
+        @hosts = [ @connection_options[:host] || @connection_options[:principal], @connection_options[:mirror] ].delete_if { |host| host.nil? }
         connect
         @database_version = select_value 'SELECT @@version', 'SCHEMA'
         @database_year = begin
@@ -407,65 +408,71 @@ module ActiveRecord
       # === SQLServer Specific (Connection Management) ================ #
 
       def connect
-        config = @connection_options
-        @connection = case config[:mode]
-                      when :dblib
-                        appname = config[:appname] || configure_application_name || Rails.application.class.name.split('::').first rescue nil
-                        login_timeout = config[:login_timeout].present? ? config[:login_timeout].to_i : nil
-                        timeout = config[:timeout].present? ? config[:timeout].to_i/1000 : nil
-                        encoding = config[:encoding].present? ? config[:encoding] : nil
-                        TinyTds::Client.new({
-                          :dataserver    => config[:dataserver],
-                          :host          => config[:host],
-                          :port          => config[:port],
-                          :username      => config[:username],
-                          :password      => config[:password],
-                          :database      => config[:database],
-                          :tds_version   => config[:tds_version],
-                          :appname       => appname,
-                          :login_timeout => login_timeout,
-                          :timeout       => timeout,
-                          :encoding      => encoding,
-                          :azure         => config[:azure]
-                        }).tap do |client|
-                          if config[:azure]
-                            client.execute("SET ANSI_NULLS ON").do
-                            client.execute("SET CURSOR_CLOSE_ON_COMMIT OFF").do
-                            client.execute("SET ANSI_NULL_DFLT_ON ON").do
-                            client.execute("SET IMPLICIT_TRANSACTIONS OFF").do
-                            client.execute("SET ANSI_PADDING ON").do
-                            client.execute("SET QUOTED_IDENTIFIER ON")
-                            client.execute("SET ANSI_WARNINGS ON").do
+        tries = 0
+        begin
+          config = @connection_options
+          config[:host] = @hosts[tries]
+          tries += 1
+          @connection = case config[:mode]
+                        when :dblib
+                          appname = config[:appname] || configure_application_name || Rails.application.class.name.split('::').first rescue nil
+                          login_timeout = config[:login_timeout].present? ? config[:login_timeout].to_i : nil
+                          timeout = config[:timeout].present? ? config[:timeout].to_i/1000 : nil
+                          encoding = config[:encoding].present? ? config[:encoding] : nil
+                          TinyTds::Client.new({
+                            :dataserver    => config[:dataserver],
+                            :host          => config[:host],
+                            :port          => config[:port],
+                            :username      => config[:username],
+                            :password      => config[:password],
+                            :database      => config[:database],
+                            :tds_version   => config[:tds_version],
+                            :appname       => appname,
+                            :login_timeout => login_timeout,
+                            :timeout       => timeout,
+                            :encoding      => encoding,
+                            :azure         => config[:azure]
+                          }).tap do |client|
+                            if config[:azure]
+                              client.execute("SET ANSI_NULLS ON").do
+                              client.execute("SET CURSOR_CLOSE_ON_COMMIT OFF").do
+                              client.execute("SET ANSI_NULL_DFLT_ON ON").do
+                              client.execute("SET IMPLICIT_TRANSACTIONS OFF").do
+                              client.execute("SET ANSI_PADDING ON").do
+                              client.execute("SET QUOTED_IDENTIFIER ON")
+                              client.execute("SET ANSI_WARNINGS ON").do
+                            else
+                              client.execute("SET ANSI_DEFAULTS ON").do
+                              client.execute("SET CURSOR_CLOSE_ON_COMMIT OFF").do
+                              client.execute("SET IMPLICIT_TRANSACTIONS OFF").do
+                            end
+                            client.execute("SET TEXTSIZE 2147483647").do
+                            client.execute("SET CONCAT_NULL_YIELDS_NULL ON").do
+                          end
+                        when :odbc
+                          if config[:dsn].include?(';')
+                            driver = ODBC::Driver.new.tap do |d|
+                              d.name = config[:dsn_name] || 'Driver1'
+                              d.attrs = config[:dsn].split(';').map{ |atr| atr.split('=') }.reject{ |kv| kv.size != 2 }.inject({}){ |h,kv| k,v = kv ; h[k] = v ; h }
+                            end
+                            ODBC::Database.new.drvconnect(driver)
                           else
-                            client.execute("SET ANSI_DEFAULTS ON").do
-                            client.execute("SET CURSOR_CLOSE_ON_COMMIT OFF").do
-                            client.execute("SET IMPLICIT_TRANSACTIONS OFF").do
-                          end
-                          client.execute("SET TEXTSIZE 2147483647").do
-                          client.execute("SET CONCAT_NULL_YIELDS_NULL ON").do
-                        end
-                      when :odbc
-                        if config[:dsn].include?(';')
-                          driver = ODBC::Driver.new.tap do |d|
-                            d.name = config[:dsn_name] || 'Driver1'
-                            d.attrs = config[:dsn].split(';').map{ |atr| atr.split('=') }.reject{ |kv| kv.size != 2 }.inject({}){ |h,kv| k,v = kv ; h[k] = v ; h }
-                          end
-                          ODBC::Database.new.drvconnect(driver)
-                        else
-                          ODBC.connect config[:dsn], config[:username], config[:password]
-                        end.tap do |c|
-                          begin
-                            c.use_time = true
-                            c.use_utc = ActiveRecord::Base.default_timezone == :utc
-                          rescue Exception => e
-                            warn "Ruby ODBC v0.99992 or higher is required."
+                            ODBC.connect config[:dsn], config[:username], config[:password]
+                          end.tap do |c|
+                            begin
+                              c.use_time = true
+                              c.use_utc = ActiveRecord::Base.default_timezone == :utc
+                            rescue Exception => e
+                              warn "Ruby ODBC v0.99992 or higher is required."
+                            end
                           end
                         end
-                      end
-        @spid = _raw_select("SELECT @@SPID", :fetch => :rows).first.first
-        configure_connection
-      rescue
-        raise unless @auto_connecting
+          @spid = _raw_select("SELECT @@SPID", :fetch => :rows).first.first
+          configure_connection
+        rescue
+          retry if tries < @hosts.length
+          raise unless @auto_connecting
+        end  
       end
 
       # Override this method so every connection can be configured to your needs.
