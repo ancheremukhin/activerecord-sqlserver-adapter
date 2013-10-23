@@ -201,7 +201,8 @@ module ActiveRecord
         # Our Responsibility
         @config = config
         @connection_options = config
-        @hosts = [ @connection_options[:host] || @connection_options[:principal], @connection_options[:mirror] ].delete_if { |host| host.nil? }
+        @hosts = [ @connection_options[:host] || @connection_options[:principal], 
+                   @connection_options[:mirror] ].delete_if { |host| host.nil? }
         connect
         @database_version = select_value 'SELECT @@version', 'SCHEMA'
         @database_year = begin
@@ -530,7 +531,7 @@ module ActiveRecord
         return false unless auto_connect
         @auto_connecting = true
         count = 0
-        while count <= (auto_connect_duration / 2)
+        while count <= ( [auto_connect_duration / 2, @hosts.length].max )
           result = reconnect!
           ActiveRecord::Base.did_retry_sqlserver_connection(self,count)
           return true if result
